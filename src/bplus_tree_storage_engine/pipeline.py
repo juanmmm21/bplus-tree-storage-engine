@@ -48,6 +48,7 @@ from bplus_tree_storage_engine.models import (
     EntryTooLargeError,
     InternalEntry,
     InvalidPageError,
+    KeyNotFoundError,
     LeafEntry,
     PageHeader,
     PageId,
@@ -68,6 +69,13 @@ _VALUE_LENGTH_FORMAT = ">H"
 _VALUE_LENGTH_SIZE = struct.calcsize(_VALUE_LENGTH_FORMAT)
 _CHILD_ID_FORMAT = ">I"
 _CHILD_ID_SIZE = struct.calcsize(_CHILD_ID_FORMAT)
+
+_UNDERFLOW_THRESHOLD = PAGE_SIZE // 2
+"""Ocupación mínima (en bytes serializados) por debajo de la cual una
+página no raíz intenta fusionarse con un hermano al borrar una entrada.
+No es un invariante de corrección (el árbol es válido igualmente por
+debajo de este umbral) sino una heurística de compacidad: ver el
+docstring de `BPlusTree.delete`."""
 
 
 @dataclass(slots=True)
@@ -787,3 +795,167 @@ class BPlusTree:
             page_count=self._metadata.page_count,
             free_page_head=self._metadata.free_page_head,
         )
+
+    def delete(self, key: bytes) -> None:
+        """Borra `key`. Lanza `KeyNotFoundError` si no existe.
+
+        Al desalojar una entrada, una página no raíz que quede por debajo
+        de `_UNDERFLOW_THRESHOLD` intenta fusionarse con un hermano bajo
+        el mismo padre inmediato (izquierdo primero, luego derecho). Si
+        ningún hermano tiene hueco para absorberla, la página se deja tal
+        cual: sigue siendo un árbol B+ válido y buscable, sólo algo menos
+        compacto. No se implementa redistribución (préstamo de una única
+        entrada entre hermanos sin fusionar): habría cubierto algo más de
+        casos de fusión fallida a cambio de una cascada de casos límite
+        adicional (el separador del padre podría crecer de tamaño al
+        tomar prestada una clave más larga) que no aporta corrección,
+        sólo compacidad marginal.
+        """
+        path: list[tuple[PageId, int]] = []
+        page_id = self._metadata.root_page_id
+        while True:
+            raw = self._pool.get_page(page_id)
+            if _peek_page_type(raw) is PageType.LEAF:
+                break
+            internal = decode_internal_page(raw)
+            index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
+            path.append((page_id, index))
+            page_id = (
+                internal.entries[index].left_child
+                if index < len(internal.entries)
+                else internal.side_pointer
+            )
+
+        leaf = decode_leaf_page(self._pool.get_page(page_id))
+        index = bisect.bisect_left(leaf.entries, key, key=lambda entry: entry.key)
+        if index >= len(leaf.entries) or leaf.entries[index].key != key:
+            raise KeyNotFoundError(f"clave no encontrada: {key!r}")
+        del leaf.entries[index]
+
+        self._rebalance_leaf(path, page_id, leaf)
+        self._save_metadata(self._metadata.root_page_id)
+
+    def _sibling_ids(
+        self, parent: InternalPage, descend_index: int
+    ) -> tuple[PageId | None, PageId | None]:
+        """Hermanos inmediatos, bajo `parent`, del hijo alcanzado usando
+        `descend_index` (ver el bookkeeping de `path` en `insert`/`delete`)."""
+        entry_count = len(parent.entries)
+        left = parent.entries[descend_index - 1].left_child if descend_index > 0 else None
+        if descend_index < entry_count:
+            right = (
+                parent.entries[descend_index + 1].left_child
+                if descend_index + 1 < entry_count
+                else parent.side_pointer
+            )
+        else:
+            right = None
+        return left, right
+
+    @staticmethod
+    def _remove_separator_and_retarget(
+        parent: InternalPage, boundary: int, surviving_page_id: PageId
+    ) -> None:
+        """Tras fusionar dos hermanos en una sola página (`surviving_page_id`),
+        elimina de `parent` el separador que los distinguía (en el índice
+        `boundary`) y redirige el puntero que quedaba justo después de ese
+        separador hacia la página superviviente."""
+        target_index = boundary + 1
+        if target_index < len(parent.entries):
+            original_key = parent.entries[target_index].key
+            parent.entries[target_index] = InternalEntry(
+                key=original_key, left_child=surviving_page_id
+            )
+        else:
+            parent.side_pointer = surviving_page_id
+        del parent.entries[boundary]
+
+    def _rebalance_leaf(
+        self, path: list[tuple[PageId, int]], leaf_page_id: PageId, leaf: LeafPage
+    ) -> None:
+        if not path or leaf_page_size(leaf.entries) >= _UNDERFLOW_THRESHOLD:
+            self._pool.put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+            return
+
+        parent_page_id, descend_index = path[-1]
+        parent = decode_internal_page(self._pool.get_page(parent_page_id))
+        left_sibling_id, right_sibling_id = self._sibling_ids(parent, descend_index)
+
+        if left_sibling_id is not None:
+            left_leaf = decode_leaf_page(self._pool.get_page(left_sibling_id))
+            merged = left_leaf.entries + leaf.entries
+            if leaf_page_size(merged) <= PAGE_SIZE:
+                self._pool.put_page(
+                    left_sibling_id, encode_leaf_page(merged, next_leaf=leaf.side_pointer)
+                )
+                self._remove_separator_and_retarget(parent, descend_index - 1, left_sibling_id)
+                self._rebalance_internal(path[:-1], parent_page_id, parent)
+                return
+
+        if right_sibling_id is not None:
+            right_leaf = decode_leaf_page(self._pool.get_page(right_sibling_id))
+            merged = leaf.entries + right_leaf.entries
+            if leaf_page_size(merged) <= PAGE_SIZE:
+                self._pool.put_page(
+                    leaf_page_id, encode_leaf_page(merged, next_leaf=right_leaf.side_pointer)
+                )
+                self._remove_separator_and_retarget(parent, descend_index, leaf_page_id)
+                self._rebalance_internal(path[:-1], parent_page_id, parent)
+                return
+
+        self._pool.put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+
+    def _rebalance_internal(
+        self, path: list[tuple[PageId, int]], node_page_id: PageId, node: InternalPage
+    ) -> None:
+        if not path:
+            if len(node.entries) == 0:
+                # El nodo raíz quedó como un simple paso intermedio hacia un
+                # único hijo: la altura del árbol se reduce adoptándolo
+                # directamente como nueva raíz. La página vieja de la raíz
+                # queda asignada pero sin referencias (no se recicla en
+                # esta versión: ver `TreeMetadata.free_page_head`).
+                self._metadata = TreeMetadata(
+                    root_page_id=node.side_pointer,
+                    page_count=self._metadata.page_count,
+                    free_page_head=self._metadata.free_page_head,
+                )
+                return
+            self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+            return
+
+        if internal_page_size(node.entries) >= _UNDERFLOW_THRESHOLD:
+            self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+            return
+
+        parent_page_id, descend_index = path[-1]
+        parent = decode_internal_page(self._pool.get_page(parent_page_id))
+        left_sibling_id, right_sibling_id = self._sibling_ids(parent, descend_index)
+
+        if left_sibling_id is not None:
+            left_node = decode_internal_page(self._pool.get_page(left_sibling_id))
+            separator_key = parent.entries[descend_index - 1].key
+            pulled_down = InternalEntry(key=separator_key, left_child=left_node.side_pointer)
+            merged = [*left_node.entries, pulled_down, *node.entries]
+            if internal_page_size(merged) <= PAGE_SIZE:
+                self._pool.put_page(
+                    left_sibling_id, encode_internal_page(merged, node.side_pointer)
+                )
+                self._remove_separator_and_retarget(parent, descend_index - 1, left_sibling_id)
+                self._rebalance_internal(path[:-1], parent_page_id, parent)
+                return
+
+        if right_sibling_id is not None:
+            right_node = decode_internal_page(self._pool.get_page(right_sibling_id))
+            separator_key = parent.entries[descend_index].key
+            pulled_down = InternalEntry(key=separator_key, left_child=node.side_pointer)
+            merged = [*node.entries, pulled_down, *right_node.entries]
+            if internal_page_size(merged) <= PAGE_SIZE:
+                self._pool.put_page(
+                    node_page_id, encode_internal_page(merged, right_node.side_pointer)
+                )
+                self._remove_separator_and_retarget(parent, descend_index, node_page_id)
+                self._rebalance_internal(path[:-1], parent_page_id, parent)
+                return
+
+        self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
