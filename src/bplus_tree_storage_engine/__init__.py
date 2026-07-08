@@ -18,6 +18,7 @@ from bplus_tree_storage_engine.models import (
     TreeMetadata,
     TruncatedPageError,
 )
+from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
 
 __all__ = [
     "BplusTreeError",
@@ -29,9 +30,11 @@ __all__ = [
     "KeyNotFoundError",
     "LeafEntry",
     "PageCorruptionError",
+    "PageDevice",
     "PageHeader",
     "PageId",
     "PageType",
+    "ReplacementPolicy",
     "StorageIOError",
     "TreeInvariantError",
     "TreeMetadata",
