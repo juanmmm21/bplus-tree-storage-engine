@@ -19,8 +19,12 @@ from bplus_tree_storage_engine.models import (
     TruncatedPageError,
 )
 from bplus_tree_storage_engine.pipeline import (
+    BufferPool,
+    FilePageDevice,
+    InMemoryPageDevice,
     InternalPage,
     LeafPage,
+    LruReplacementPolicy,
     decode_internal_page,
     decode_leaf_page,
     decode_metadata_page,
@@ -35,15 +39,19 @@ from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
 
 __all__ = [
     "BplusTreeError",
+    "BufferPool",
     "BufferPoolConfig",
     "ChecksumMismatchError",
     "EntryTooLargeError",
+    "FilePageDevice",
+    "InMemoryPageDevice",
     "InternalEntry",
     "InternalPage",
     "InvalidPageError",
     "KeyNotFoundError",
     "LeafEntry",
     "LeafPage",
+    "LruReplacementPolicy",
     "PageCorruptionError",
     "PageDevice",
     "PageHeader",
