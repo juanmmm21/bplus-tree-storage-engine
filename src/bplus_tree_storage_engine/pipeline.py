@@ -139,8 +139,14 @@ def _assemble_page(page_type: PageType, cells: list[bytes], side_pointer: PageId
     free_space_offset = offset
 
     header_bytes = struct.pack(
-        HEADER_FORMAT, MAGIC, PAGE_FORMAT_VERSION, int(page_type), cell_count, free_space_offset,
-        side_pointer, 0,
+        HEADER_FORMAT,
+        MAGIC,
+        PAGE_FORMAT_VERSION,
+        int(page_type),
+        cell_count,
+        free_space_offset,
+        side_pointer,
+        0,
     )
     buffer[0:HEADER_SIZE] = header_bytes
     for index, cell_offset in enumerate(offsets):
@@ -833,9 +839,7 @@ class BPlusTree:
 
         new_root_page_id = self._pool.allocate_page()
         new_root_entries = [InternalEntry(key=separator_key, left_child=left_page_id)]
-        self._pool.put_page(
-            new_root_page_id, encode_internal_page(new_root_entries, right_page_id)
-        )
+        self._pool.put_page(new_root_page_id, encode_internal_page(new_root_entries, right_page_id))
         self._metadata = TreeMetadata(
             root_page_id=new_root_page_id,
             page_count=self._metadata.page_count,

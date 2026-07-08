@@ -92,9 +92,7 @@ class PageHeader:
         if self.cell_count < 0:
             raise ValueError(f"cell_count debe ser >= 0, recibido {self.cell_count}")
         if not (HEADER_SIZE <= self.free_space_offset <= PAGE_SIZE):
-            raise ValueError(
-                f"free_space_offset fuera de rango: {self.free_space_offset}"
-            )
+            raise ValueError(f"free_space_offset fuera de rango: {self.free_space_offset}")
         if self.side_pointer < 0:
             raise ValueError(f"side_pointer debe ser >= 0, recibido {self.side_pointer}")
 

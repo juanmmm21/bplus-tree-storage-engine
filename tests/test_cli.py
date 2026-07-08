@@ -41,9 +41,7 @@ def test_delete_missing_key_reports_error(
     assert "error:" in capsys.readouterr().err
 
 
-def test_scan_prints_all_pairs_in_order(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_scan_prints_all_pairs_in_order(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     db = tmp_path / "demo.db"
     for key, value in [("bob", "25"), ("alice", "30"), ("carol", "35")]:
         main(["put", "--path", str(db), "--key", key, "--value", value])
