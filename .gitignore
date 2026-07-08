@@ -1,0 +1,40 @@
+# Bytecode y cachés
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Empaquetado
+build/
+dist/
+*.egg-info/
+
+# Configuración de editor / SO
+.vscode/
+.idea/
+.DS_Store
+
+# Contexto de agentes de IA (nunca se sube al repo público)
+AGENTS.md
+CLAUDE.md
+START_HERE.md
+.claude/
+
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+
+# Datos locales generados en desarrollo
+*.db
+*.sqlite3
+/data/
+/logs/
