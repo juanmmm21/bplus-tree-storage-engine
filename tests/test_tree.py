@@ -183,6 +183,40 @@ def test_data_survives_close_and_reopen(tmp_path: Path) -> None:
             assert tree.search(key) is not None
 
 
+def test_scan_full_range_yields_sorted_pairs() -> None:
+    tree = _new_tree(capacity=4)
+    keys = [f"key-{i:05d}".encode() for i in range(500)]
+    shuffled = keys[:]
+    random.Random(4).shuffle(shuffled)
+    for key in shuffled:
+        tree.insert(key, key.upper())
+
+    result = list(tree.scan())
+    assert [k for k, _ in result] == sorted(keys)
+    assert all(v == k.upper() for k, v in result)
+
+
+def test_scan_bounded_range_is_half_open() -> None:
+    tree = _new_tree(capacity=4)
+    keys = [f"key-{i:05d}".encode() for i in range(200)]
+    for key in keys:
+        tree.insert(key, b"v")
+
+    start, end = keys[50], keys[80]
+    result = [k for k, _ in tree.scan(start=start, end=end)]
+    assert result == keys[50:80]
+
+
+def test_scan_with_only_start_bound() -> None:
+    tree = _new_tree(capacity=4)
+    keys = [f"key-{i:05d}".encode() for i in range(100)]
+    for key in keys:
+        tree.insert(key, b"v")
+
+    result = [k for k, _ in tree.scan(start=keys[70])]
+    assert result == keys[70:]
+
+
 def test_random_insert_delete_matches_reference_dict() -> None:
     rng = random.Random(99)
     tree = _new_tree(capacity=5)

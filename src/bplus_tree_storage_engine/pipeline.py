@@ -25,6 +25,7 @@ import os
 import struct
 import zlib
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
@@ -684,6 +685,44 @@ class BPlusTree:
                 if index < len(internal.entries)
                 else internal.side_pointer
             )
+
+    def scan(
+        self, start: bytes | None = None, end: bytes | None = None
+    ) -> Iterator[tuple[bytes, bytes]]:
+        """Recorre las entradas en orden ascendente de clave, opcionalmente
+        acotado a `[start, end)`. Sigue la cadena de hojas enlazadas
+        (`side_pointer`) en vez de recorrer el árbol completo: la ventaja
+        clásica de un índice B+ frente a uno hash para lecturas de rango.
+        """
+        page_id = self._locate_starting_leaf(start)
+        while page_id != NULL_PAGE_ID:
+            leaf = decode_leaf_page(self._pool.get_page(page_id))
+            for entry in leaf.entries:
+                if start is not None and entry.key < start:
+                    continue
+                if end is not None and entry.key >= end:
+                    return
+                yield entry.key, entry.value
+            page_id = leaf.side_pointer
+
+    def _locate_starting_leaf(self, start: bytes | None) -> PageId:
+        page_id = self._metadata.root_page_id
+        while True:
+            raw = self._pool.get_page(page_id)
+            if _peek_page_type(raw) is PageType.LEAF:
+                return page_id
+            internal = decode_internal_page(raw)
+            if start is None:
+                page_id = (
+                    internal.entries[0].left_child if internal.entries else internal.side_pointer
+                )
+            else:
+                index = bisect.bisect_right(internal.entries, start, key=lambda entry: entry.key)
+                page_id = (
+                    internal.entries[index].left_child
+                    if index < len(internal.entries)
+                    else internal.side_pointer
+                )
 
     def insert(self, key: bytes, value: bytes) -> None:
         """Inserta `key`/`value`, o sobrescribe el valor si `key` ya existía."""
