@@ -19,6 +19,7 @@ from bplus_tree_storage_engine.models import (
     TruncatedPageError,
 )
 from bplus_tree_storage_engine.pipeline import (
+    BPlusTree,
     BufferPool,
     FilePageDevice,
     InMemoryPageDevice,
@@ -38,6 +39,7 @@ from bplus_tree_storage_engine.pipeline import (
 from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
 
 __all__ = [
+    "BPlusTree",
     "BplusTreeError",
     "BufferPool",
     "BufferPoolConfig",

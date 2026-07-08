@@ -19,6 +19,7 @@ serializarlo en su propia capa antes de llamar a estas clases.
 
 from __future__ import annotations
 
+import bisect
 import io
 import os
 import struct
@@ -34,6 +35,9 @@ from bplus_tree_storage_engine.models import (
     HEADER_FORMAT,
     HEADER_SIZE,
     MAGIC,
+    MAX_ENTRY_SIZE,
+    MAX_KEY_SIZE,
+    METADATA_PAGE_ID,
     METADATA_PAYLOAD_FORMAT,
     METADATA_PAYLOAD_SIZE,
     NULL_PAGE_ID,
@@ -41,6 +45,7 @@ from bplus_tree_storage_engine.models import (
     PAGE_SIZE,
     BufferPoolConfig,
     ChecksumMismatchError,
+    EntryTooLargeError,
     InternalEntry,
     InvalidPageError,
     LeafEntry,
@@ -56,6 +61,7 @@ from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
 
 _CHECKSUM_SIZE = struct.calcsize(">I")
 _CHECKSUM_OFFSET = HEADER_SIZE - _CHECKSUM_SIZE
+_PAGE_TYPE_OFFSET = struct.calcsize(">4sB")
 _KEY_LENGTH_FORMAT = ">H"
 _KEY_LENGTH_SIZE = struct.calcsize(_KEY_LENGTH_FORMAT)
 _VALUE_LENGTH_FORMAT = ">H"
@@ -482,6 +488,9 @@ class BufferPool:
     def allocate_page(self) -> PageId:
         return self._device.allocate_page()
 
+    def page_count(self) -> int:
+        return self._device.page_count()
+
     def _insert_new(self, page_id: PageId, entry: _CacheEntry) -> None:
         if len(self._cache) >= self._capacity:
             self._evict_one()
@@ -520,3 +529,261 @@ class BufferPool:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+# --- Árbol B+ ---------------------------------------------------------
+#
+# Formato de las páginas internas: `entries` ordenadas por clave
+# ascendente donde `entries[i].left_child` contiene las claves del rango
+# [entries[i-1].key, entries[i].key) (o (-inf, entries[0].key) para i=0);
+# `side_pointer` es el hijo más a la derecha, con las claves >= la última
+# clave separadora. Ver `InternalEntry` en `models.py`.
+#
+# El split de hoja copia la clave separadora (las hojas guardan todos los
+# datos); el split de nodo interno la promueve (los nodos internos sólo
+# enrutan, así que la clave promovida deja de vivir en este nivel).
+
+
+def _peek_page_type(data: bytes) -> PageType:
+    """Lee sólo el campo `page_type` de la cabecera, sin verificar
+    checksum, para decidir qué decoder invocar durante un recorrido. La
+    corrupción real se detecta igualmente al llamar al decoder completo
+    correspondiente (que sí verifica el checksum)."""
+    if len(data) != PAGE_SIZE:
+        raise TruncatedPageError(
+            f"se esperaban {PAGE_SIZE} bytes de página y se recibieron {len(data)}"
+        )
+    raw_type = data[_PAGE_TYPE_OFFSET]
+    try:
+        return PageType(raw_type)
+    except ValueError as exc:
+        raise InvalidPageError(f"page_type desconocido: {raw_type}") from exc
+
+
+def leaf_page_size(entries: list[LeafEntry]) -> int:
+    """Tamaño total, en bytes, que ocuparía una página hoja con estas
+    entradas: cabecera + array de punteros + contenido de celdas."""
+    content = sum(leaf_cell_size(entry.key, entry.value) for entry in entries)
+    return HEADER_SIZE + len(entries) * CELL_POINTER_SIZE + content
+
+
+def internal_page_size(entries: list[InternalEntry]) -> int:
+    """Equivalente a `leaf_page_size` para una página interna."""
+    content = sum(internal_cell_size(entry.key) for entry in entries)
+    return HEADER_SIZE + len(entries) * CELL_POINTER_SIZE + content
+
+
+def _find_leaf_split_point(entries: list[LeafEntry]) -> int:
+    """Índice a partir del cual empieza la mitad derecha tras un split.
+
+    El corte se elige por tamaño acumulado (no por cuenta de entradas):
+    dado que cada entrada individual está acotada por `MAX_ENTRY_SIZE`
+    (ver `EntryTooLargeError`), y que estas `entries` sólo exceden
+    `PAGE_SIZE` por, como mucho, una entrada de más sobre una página que
+    antes cabía, siempre existe un corte que deja ambas mitades por
+    debajo de `PAGE_SIZE`. Repartir por cuenta en vez de por tamaño podría
+    dejar, en teoría, una mitad arbitrariamente grande si las entradas
+    tienen tamaños muy dispares.
+    """
+    cumulative = HEADER_SIZE + CELL_POINTER_SIZE + leaf_cell_size(entries[0].key, entries[0].value)
+    split_at = 1
+    for index in range(1, len(entries)):
+        entry = entries[index]
+        cumulative += CELL_POINTER_SIZE + leaf_cell_size(entry.key, entry.value)
+        if cumulative > PAGE_SIZE:
+            break
+        split_at = index + 1
+    return split_at
+
+
+def _find_internal_split_point(entries: list[InternalEntry]) -> int:
+    """Índice de la entrada a promover al padre: la mitad izquierda queda
+    en `entries[:m]` (con `side_pointer` = `entries[m].left_child`), la
+    derecha en `entries[m + 1:]`. Mismo razonamiento de corte por tamaño
+    acumulado que `_find_leaf_split_point`."""
+    cumulative = HEADER_SIZE + CELL_POINTER_SIZE + internal_cell_size(entries[0].key)
+    split_at = 0
+    for index in range(1, len(entries)):
+        entry = entries[index]
+        cumulative += CELL_POINTER_SIZE + internal_cell_size(entry.key)
+        if cumulative > PAGE_SIZE:
+            break
+        split_at = index
+    return split_at
+
+
+class BPlusTree:
+    """Árbol B+ persistente: índice primario clave -> valor sobre un
+    `BufferPool`. La página 0 del dispositivo subyacente son siempre los
+    metadatos (`TreeMetadata`); si el dispositivo está vacío, se
+    inicializa aquí un árbol nuevo (metadatos + una hoja raíz vacía).
+    """
+
+    def __init__(self, buffer_pool: BufferPool) -> None:
+        self._pool = buffer_pool
+        if self._pool.page_count() == 0:
+            self._bootstrap()
+        self._metadata = decode_metadata_page(self._pool.get_page(METADATA_PAGE_ID))
+
+    def _bootstrap(self) -> None:
+        metadata_page_id = self._pool.allocate_page()
+        root_page_id = self._pool.allocate_page()
+        if metadata_page_id != METADATA_PAGE_ID:
+            raise TreeInvariantError(
+                f"la página de metadatos debía asignarse como {METADATA_PAGE_ID}, "
+                f"se asignó {metadata_page_id}"
+            )
+        self._pool.put_page(root_page_id, encode_leaf_page([], next_leaf=NULL_PAGE_ID))
+        metadata = TreeMetadata(root_page_id=root_page_id, page_count=self._pool.page_count())
+        self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
+        self._pool.flush()
+
+    def _save_metadata(self, root_page_id: PageId) -> None:
+        self._metadata = TreeMetadata(
+            root_page_id=root_page_id,
+            page_count=self._pool.page_count(),
+            free_page_head=self._metadata.free_page_head,
+        )
+        self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(self._metadata))
+
+    def flush(self) -> None:
+        self._pool.flush()
+
+    def close(self) -> None:
+        self._pool.close()
+
+    def __enter__(self) -> BPlusTree:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def search(self, key: bytes) -> bytes | None:
+        """Devuelve el valor asociado a `key`, o `None` si no existe."""
+        page_id = self._metadata.root_page_id
+        while True:
+            raw = self._pool.get_page(page_id)
+            if _peek_page_type(raw) is PageType.LEAF:
+                leaf = decode_leaf_page(raw)
+                index = bisect.bisect_left(leaf.entries, key, key=lambda entry: entry.key)
+                if index < len(leaf.entries) and leaf.entries[index].key == key:
+                    return leaf.entries[index].value
+                return None
+            internal = decode_internal_page(raw)
+            index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
+            page_id = (
+                internal.entries[index].left_child
+                if index < len(internal.entries)
+                else internal.side_pointer
+            )
+
+    def insert(self, key: bytes, value: bytes) -> None:
+        """Inserta `key`/`value`, o sobrescribe el valor si `key` ya existía."""
+        if leaf_cell_size(key, value) > MAX_ENTRY_SIZE or len(key) > MAX_KEY_SIZE:
+            raise EntryTooLargeError(
+                f"la entrada para la clave de {len(key)} bytes excede el máximo soportado"
+            )
+
+        path: list[tuple[PageId, int]] = []
+        page_id = self._metadata.root_page_id
+        while True:
+            raw = self._pool.get_page(page_id)
+            if _peek_page_type(raw) is PageType.LEAF:
+                break
+            internal = decode_internal_page(raw)
+            index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
+            path.append((page_id, index))
+            page_id = (
+                internal.entries[index].left_child
+                if index < len(internal.entries)
+                else internal.side_pointer
+            )
+
+        leaf = decode_leaf_page(self._pool.get_page(page_id))
+        index = bisect.bisect_left(leaf.entries, key, key=lambda entry: entry.key)
+        if index < len(leaf.entries) and leaf.entries[index].key == key:
+            leaf.entries[index] = LeafEntry(key=key, value=value)
+        else:
+            leaf.entries.insert(index, LeafEntry(key=key, value=value))
+
+        if leaf_page_size(leaf.entries) <= PAGE_SIZE:
+            self._pool.put_page(page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+            self._save_metadata(self._metadata.root_page_id)
+            return
+
+        split_at = _find_leaf_split_point(leaf.entries)
+        left_entries = leaf.entries[:split_at]
+        right_entries = leaf.entries[split_at:]
+        separator_key = right_entries[0].key
+
+        new_leaf_page_id = self._pool.allocate_page()
+        self._pool.put_page(
+            new_leaf_page_id, encode_leaf_page(right_entries, next_leaf=leaf.side_pointer)
+        )
+        self._pool.put_page(page_id, encode_leaf_page(left_entries, next_leaf=new_leaf_page_id))
+
+        self._propagate_split(path, separator_key, page_id, new_leaf_page_id)
+        self._save_metadata(self._metadata.root_page_id)
+
+    def _propagate_split(
+        self,
+        path: list[tuple[PageId, int]],
+        separator_key: bytes,
+        left_page_id: PageId,
+        right_page_id: PageId,
+    ) -> None:
+        """Inserta `(separator_key, left_page_id)` en el padre inmediato de
+        `path` (ajustando qué apunta a `right_page_id`), haciendo split en
+        cascada hacia arriba si hace falta. Si `path` se agota, crea una
+        raíz nueva y actualiza `self._metadata` (sin persistirla: eso lo
+        hace el llamante)."""
+        while path:
+            parent_page_id, descend_index = path.pop()
+            parent = decode_internal_page(self._pool.get_page(parent_page_id))
+
+            if descend_index == len(parent.entries):
+                parent.side_pointer = right_page_id
+                insert_position = len(parent.entries)
+            else:
+                original = parent.entries[descend_index]
+                parent.entries[descend_index] = InternalEntry(
+                    key=original.key, left_child=right_page_id
+                )
+                insert_position = descend_index
+            parent.entries.insert(
+                insert_position, InternalEntry(key=separator_key, left_child=left_page_id)
+            )
+
+            if internal_page_size(parent.entries) <= PAGE_SIZE:
+                self._pool.put_page(
+                    parent_page_id, encode_internal_page(parent.entries, parent.side_pointer)
+                )
+                return
+
+            split_at = _find_internal_split_point(parent.entries)
+            promoted = parent.entries[split_at]
+            left_entries = parent.entries[:split_at]
+            right_entries = parent.entries[split_at + 1 :]
+
+            new_right_page_id = self._pool.allocate_page()
+            self._pool.put_page(
+                new_right_page_id, encode_internal_page(right_entries, parent.side_pointer)
+            )
+            self._pool.put_page(
+                parent_page_id, encode_internal_page(left_entries, promoted.left_child)
+            )
+
+            separator_key = promoted.key
+            left_page_id = parent_page_id
+            right_page_id = new_right_page_id
+
+        new_root_page_id = self._pool.allocate_page()
+        new_root_entries = [InternalEntry(key=separator_key, left_child=left_page_id)]
+        self._pool.put_page(
+            new_root_page_id, encode_internal_page(new_root_entries, right_page_id)
+        )
+        self._metadata = TreeMetadata(
+            root_page_id=new_root_page_id,
+            page_count=self._metadata.page_count,
+            free_page_head=self._metadata.free_page_head,
+        )

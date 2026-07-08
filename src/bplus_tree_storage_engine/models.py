@@ -52,8 +52,15 @@ METADATA_PAYLOAD_SIZE = struct.calcsize(METADATA_PAYLOAD_FORMAT)
 MIN_CELLS_PER_PAGE = 4
 _USABLE_SPACE = PAGE_SIZE - HEADER_SIZE
 MAX_ENTRY_SIZE = (_USABLE_SPACE // MIN_CELLS_PER_PAGE) - CELL_POINTER_SIZE
-"""Tamaño máximo, en bytes, de una celda ya serializada (claves + valores
-incluidos sus prefijos de longitud). Ver `EntryTooLargeError`."""
+"""Tamaño máximo, en bytes, de una celda de hoja ya serializada (clave +
+valor, incluidos sus prefijos de longitud). Ver `EntryTooLargeError`."""
+
+_INTERNAL_CELL_OVERHEAD = 2 + 4  # prefijo de longitud de clave + PageId de hijo
+MAX_KEY_SIZE = MAX_ENTRY_SIZE - _INTERNAL_CELL_OVERHEAD
+"""Tamaño máximo, en bytes, de una clave. Acota también la celda interna
+resultante de promover esa clave (que no lleva valor, sólo un `PageId`),
+para que nunca exceda `MAX_ENTRY_SIZE` aunque el valor original fuera
+vacío."""
 
 
 class PageType(IntEnum):
