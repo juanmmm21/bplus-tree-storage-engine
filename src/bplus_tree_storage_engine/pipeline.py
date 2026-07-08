@@ -655,6 +655,13 @@ class BPlusTree:
         )
         self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(self._metadata))
 
+    @property
+    def metadata(self) -> TreeMetadata:
+        """Instantánea de sólo lectura de los metadatos actuales del árbol
+        (página raíz, páginas asignadas). Para inspección/CLI; la lógica
+        interna sigue usando `self._metadata` directamente."""
+        return self._metadata
+
     def flush(self) -> None:
         self._pool.flush()
 
