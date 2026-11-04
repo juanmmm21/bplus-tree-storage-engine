@@ -102,6 +102,20 @@ killed before its first flush. The same tests run in the default mode fail, whic
 opens its on-disk B+Tree with `crash_consistent=True`. The cost is a second write of every dirty
 page per flush and a pool that can temporarily exceed its capacity.
 
+### Decoded internal pages
+
+Every insert, search and delete descends from the root, and each internal page on the way used to
+be decoded from bytes every time: in nanosql's bulk-load profile (pure Python) that was 35 % of the
+load — 183,957 internal-page decodes for 43,372 inserts. `BPlusTree` now keeps an LRU of decoded
+internal pages (`INTERNAL_CACHE_PAGES = 1024`) used **only by the descents**, which never modify
+what they read. Every write the tree makes goes through one method that invalidates that page, and
+the paths that do modify a node (splits, merges) still decode their own copy, so a cached object is
+never mutated. `tests/test_internal_cache.py` runs a random insert/overwrite/delete workload with
+cascading splits and merges against a `dict` with a cache of 1, 2 and 1,024 pages, and counts
+decodes: 1,000 inserts into a 3,000-key tree decode 1,053 internal pages without the cache and 106
+with it. The metadata page is also no longer rewritten (identical) on every insert, only when it
+changes.
+
 ### Optional Rust accelerator for the page codec
 
 Profiling nanosql on a TPC-H-like workload put this engine's page decoding
