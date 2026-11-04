@@ -59,6 +59,17 @@ class PageDevice(Protocol):
 
 
 @runtime_checkable
+class AtomicPageDevice(PageDevice, Protocol):
+    """Dispositivo capaz de escribir un lote de páginas de forma atómica
+    frente a un crash: tras reabrir se ve el lote entero o nada de él."""
+
+    def write_pages_atomically(self, pages: list[tuple[PageId, bytes]]) -> None:
+        """Escribe y hace durable `pages` como una unidad. Al volver, todas
+        las páginas están en su sitio y sincronizadas."""
+        ...
+
+
+@runtime_checkable
 class ReplacementPolicy(Protocol):
     """Política de reemplazo del buffer pool (LRU u otra), desacoplada de
     la mecánica de fijar/liberar páginas del propio buffer pool."""

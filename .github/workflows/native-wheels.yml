@@ -1,0 +1,76 @@
+name: native wheels
+
+# Construye el acelerador Rust opcional (native/, PyO3 + maturin, abi3 para
+# CPython >= 3.11) para Linux x86_64 y macOS arm64, y prueba el motor con y
+# sin él: los mismos tests deben pasar en ambos caminos.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: macos-14
+            target: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: native
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: native/dist/*.whl
+
+  test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-${{ matrix.os }}-*
+          path: wheels
+          merge-multiple: true
+      - run: pip install -e ".[dev]" wheels/*.whl
+      - name: Tests with the native codec
+        run: python -c "import bplus_tree_storage_engine.pipeline as p; assert p.NATIVE_CODEC" && pytest -q
+      - name: Same tests in pure Python
+        run: pytest -q
+        env:
+          BPLUS_TREE_PURE_PYTHON: "1"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check src tests && mypy --strict src/
+      - run: cargo clippy --manifest-path native/Cargo.toml --release -- -D warnings

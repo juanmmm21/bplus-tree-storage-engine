@@ -1,0 +1,19 @@
+[package]
+name = "bplus-tree-native"
+version = "0.2.0"
+edition = "2021"
+description = "Optional Rust accelerator for bplus-tree-storage-engine's page codec"
+license = "MIT"
+publish = false
+
+[lib]
+name = "bplus_tree_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
+crc32fast = "1.4"
+
+[profile.release]
+lto = true
+codegen-units = 1

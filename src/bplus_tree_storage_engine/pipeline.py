@@ -20,6 +20,7 @@ serializarlo en su propia capa antes de llamar a estas clases.
 from __future__ import annotations
 
 import bisect
+import importlib
 import io
 import os
 import struct
@@ -28,7 +29,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from bplus_tree_storage_engine.models import (
     CELL_POINTER_FORMAT,
@@ -59,7 +60,7 @@ from bplus_tree_storage_engine.models import (
     TreeMetadata,
     TruncatedPageError,
 )
-from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
+from bplus_tree_storage_engine.protocols import AtomicPageDevice, PageDevice, ReplacementPolicy
 
 _CHECKSUM_SIZE = struct.calcsize(">I")
 _CHECKSUM_OFFSET = HEADER_SIZE - _CHECKSUM_SIZE
@@ -223,7 +224,55 @@ def encode_leaf_page(entries: list[LeafEntry], next_leaf: PageId = NULL_PAGE_ID)
     return _assemble_page(PageType.LEAF, cells, next_leaf)
 
 
+# --- Acelerador nativo opcional ------------------------------------------------
+#
+# `bplus-tree-storage-engine-native` (crate PyO3 en `native/`) decodifica las
+# páginas hoja e internas en Rust. Es opcional: sin él, o con
+# `BPLUS_TREE_PURE_PYTHON=1`, todo funciona igual en Python puro. Contrato:
+# el camino nativo sólo acepta páginas válidas y en rango; ante cualquier
+# anomalía devuelve `None` y se usa la implementación Python de referencia,
+# que produce el resultado o el error exacto de siempre. Los tests de
+# propiedades comparan ambos caminos sobre páginas aleatorias y corruptas.
+
+
+def _load_native() -> Any:
+    if os.environ.get("BPLUS_TREE_PURE_PYTHON"):
+        return None
+    try:
+        return importlib.import_module("bplus_tree_native")
+    except ImportError:
+        return None
+
+
+_native: Any = _load_native()
+NATIVE_CODEC = _native is not None
+
+
 def decode_leaf_page(data: bytes) -> LeafPage:
+    if _native is not None and type(data) is bytes:
+        decoded = _native.decode_leaf_cells(data)
+        if decoded is not None:
+            side_pointer, pairs = decoded
+            return LeafPage(
+                side_pointer=side_pointer,
+                entries=[LeafEntry.trusted(key, value) for key, value in pairs],
+            )
+    return _decode_leaf_page_python(data)
+
+
+def decode_internal_page(data: bytes) -> InternalPage:
+    if _native is not None and type(data) is bytes:
+        decoded = _native.decode_internal_cells(data)
+        if decoded is not None:
+            side_pointer, pairs = decoded
+            return InternalPage(
+                side_pointer=side_pointer,
+                entries=[InternalEntry.trusted(key, child) for key, child in pairs],
+            )
+    return _decode_internal_page_python(data)
+
+
+def _decode_leaf_page_python(data: bytes) -> LeafPage:
     header, cells = _disassemble_page(data, PageType.LEAF)
     entries: list[LeafEntry] = []
     for cell in cells:
@@ -252,7 +301,7 @@ def encode_internal_page(entries: list[InternalEntry], rightmost_child: PageId) 
     return _assemble_page(PageType.INTERNAL, cells, rightmost_child)
 
 
-def decode_internal_page(data: bytes) -> InternalPage:
+def _decode_internal_page_python(data: bytes) -> InternalPage:
     header, cells = _disassemble_page(data, PageType.INTERNAL)
     entries: list[InternalEntry] = []
     for cell in cells:
@@ -302,6 +351,56 @@ def decode_metadata_page(data: bytes) -> TreeMetadata:
     )
 
 
+# Diario de doble escritura de `FilePageDevice.write_pages_atomically`:
+# cabecera (magic, versión, nº de páginas), registros (page_id + página) y
+# un CRC32 final de todo lo anterior. Un diario incompleto o con CRC
+# erróneo es el rastro de un crash *antes* de empezar las escrituras en su
+# sitio, así que se descarta; uno completo se re-aplica entero.
+_JOURNAL_MAGIC = b"BPTJ"
+_JOURNAL_VERSION = 1
+_JOURNAL_HEADER = struct.Struct(">4sII")
+_JOURNAL_PAGE_ID = struct.Struct(">I")
+_JOURNAL_CRC = struct.Struct(">I")
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Hace durable la creación o el borrado de una entrada del directorio
+    (el diario). En Windows no hay descriptores de directorio: no aplica."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise StorageIOError(f"fallo de E/S en fsync del directorio {directory}: {exc}") from exc
+
+
+def _parse_journal(data: bytes) -> list[tuple[PageId, bytes]] | None:
+    """Páginas de un diario completo y válido, o `None` si está a medias."""
+    if len(data) < _JOURNAL_HEADER.size + _JOURNAL_CRC.size:
+        return None
+    magic, version, count = _JOURNAL_HEADER.unpack_from(data, 0)
+    record = _JOURNAL_PAGE_ID.size + PAGE_SIZE
+    if magic != _JOURNAL_MAGIC or version != _JOURNAL_VERSION:
+        return None
+    if len(data) != _JOURNAL_HEADER.size + count * record + _JOURNAL_CRC.size:
+        return None
+    (stored,) = _JOURNAL_CRC.unpack_from(data, len(data) - _JOURNAL_CRC.size)
+    if zlib.crc32(data[: -_JOURNAL_CRC.size]) & 0xFFFFFFFF != stored:
+        return None
+    pages: list[tuple[PageId, bytes]] = []
+    offset = _JOURNAL_HEADER.size
+    for _ in range(count):
+        (page_id,) = _JOURNAL_PAGE_ID.unpack_from(data, offset)
+        offset += _JOURNAL_PAGE_ID.size
+        pages.append((PageId(page_id), data[offset : offset + PAGE_SIZE]))
+        offset += PAGE_SIZE
+    return pages
+
+
 class FilePageDevice:
     """`PageDevice` respaldado por un archivo real en disco.
 
@@ -310,16 +409,72 @@ class FilePageDevice:
     o `allocate_page` interrumpido a mitad (proceso matado durante la
     escritura) y se reporta como `TruncatedPageError` en vez de arrancar
     con datos parciales silenciosamente.
+
+    También es un `AtomicPageDevice`: `write_pages_atomically` escribe el
+    lote primero en un diario al lado (`<archivo>.journal`, con fsync) y
+    sólo después en su sitio. Al abrir, un diario completo se re-aplica y
+    uno a medias se descarta, así que un crash en cualquier punto deja el
+    lote entero o nada de él.
     """
 
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
+        self._journal_path = self._path.with_name(self._path.name + ".journal")
         mode = "r+b" if self._path.exists() else "w+b"
         try:
             self._file: IO[bytes] = open(self._path, mode)  # noqa: SIM115 (cerrado en close())
         except OSError as exc:
             raise StorageIOError(f"no se pudo abrir {self._path}: {exc}") from exc
+        self._recover_journal()
         self._page_count = self._read_page_count_from_file_size()
+
+    def _recover_journal(self) -> None:
+        if not self._journal_path.exists():
+            return
+        try:
+            pages = _parse_journal(self._journal_path.read_bytes())
+            if pages is not None:
+                for page_id, data in pages:
+                    self._file.seek(page_id * PAGE_SIZE)
+                    self._file.write(data)
+                self._file.flush()
+                os.fsync(self._file.fileno())
+            self._journal_path.unlink()
+        except OSError as exc:
+            raise StorageIOError(f"fallo de E/S recuperando {self._journal_path}: {exc}") from exc
+        _fsync_directory(self._path.parent)
+
+    def write_pages_atomically(self, pages: list[tuple[PageId, bytes]]) -> None:
+        if not pages:
+            self.sync()
+            return
+        parts = [_JOURNAL_HEADER.pack(_JOURNAL_MAGIC, _JOURNAL_VERSION, len(pages))]
+        for page_id, data in pages:
+            if len(data) != PAGE_SIZE:
+                raise ValueError(f"write_page requiere {PAGE_SIZE} bytes, recibidos {len(data)}")
+            if page_id >= self._page_count:
+                raise ValueError(f"write_page en página {page_id} no asignada aún")
+            parts += [_JOURNAL_PAGE_ID.pack(page_id), data]
+        body = b"".join(parts)
+        blob = body + _JOURNAL_CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
+        try:
+            with open(self._journal_path, "wb") as journal:
+                journal.write(blob)
+                journal.flush()
+                os.fsync(journal.fileno())
+        except OSError as exc:
+            raise StorageIOError(f"fallo de E/S escribiendo {self._journal_path}: {exc}") from exc
+        _fsync_directory(self._path.parent)
+        # Desde aquí el lote sobrevive a cualquier crash: lo que no llegue a
+        # escribirse en su sitio lo re-aplica `_recover_journal` al abrir.
+        for page_id, data in pages:
+            self.write_page(page_id, data)
+        self.sync()
+        try:
+            self._journal_path.unlink()
+        except OSError as exc:
+            raise StorageIOError(f"fallo de E/S borrando {self._journal_path}: {exc}") from exc
+        _fsync_directory(self._path.parent)
 
     def _read_page_count_from_file_size(self) -> int:
         try:
@@ -475,6 +630,7 @@ class BufferPool:
     ) -> None:
         self._device = device
         self._capacity = config.capacity
+        self._crash_consistent = config.crash_consistent
         self._policy: ReplacementPolicy = (
             replacement_policy if replacement_policy is not None else LruReplacementPolicy()
         )
@@ -512,6 +668,9 @@ class BufferPool:
         self._cache[page_id] = entry
 
     def _evict_one(self) -> None:
+        if self._crash_consistent:
+            self._evict_one_clean()
+            return
         victim = self._policy.choose_victim()
         while victim is not None and victim not in self._cache:
             self._policy.forget(victim)
@@ -525,14 +684,47 @@ class BufferPool:
         if evicted.dirty:
             self._device.write_page(victim, bytes(evicted.data))
 
+    def _evict_one_clean(self) -> None:
+        """Desalojo *no-steal*: la víctima es la página limpia menos
+        reciente. Las sucias se rotan al final del orden sin escribirlas;
+        si todas lo están, no se desaloja nada y el pool crece por encima
+        de `capacity` hasta el próximo `flush()`."""
+        attempts = len(self._cache)
+        while attempts > 0:
+            victim = self._policy.choose_victim()
+            if victim is None:
+                return
+            if victim not in self._cache:
+                self._policy.forget(victim)
+                continue
+            attempts -= 1
+            if not self._cache[victim].dirty:
+                del self._cache[victim]
+                self._policy.forget(victim)
+                return
+            self._policy.record_access(victim)
+
     def flush(self) -> None:
         """Persiste todas las páginas sucias y fuerza `fsync` del
         dispositivo. Ninguna escritura se considera durable hasta que
-        este método retorna."""
-        for page_id, entry in self._cache.items():
-            if entry.dirty:
-                self._device.write_page(page_id, bytes(entry.data))
+        este método retorna. En modo `crash_consistent`, y si el
+        dispositivo es un `AtomicPageDevice`, el lote es atómico."""
+        dirty = [(page_id, entry) for page_id, entry in self._cache.items() if entry.dirty]
+        if self._crash_consistent and isinstance(self._device, AtomicPageDevice):
+            self._device.write_pages_atomically([(pid, bytes(e.data)) for pid, e in dirty])
+            for _, entry in dirty:
                 entry.dirty = False
+            # Lo que creció por encima de `capacity` por no-steal ya está
+            # limpio: se vuelve al tamaño configurado.
+            while len(self._cache) > self._capacity:
+                before = len(self._cache)
+                self._evict_one_clean()
+                if len(self._cache) == before:
+                    break
+            return
+        for page_id, entry in dirty:
+            self._device.write_page(page_id, bytes(entry.data))
+            entry.dirty = False
         self._device.sync()
 
     def close(self) -> None:
@@ -627,6 +819,10 @@ def _find_internal_split_point(entries: list[InternalEntry]) -> int:
     return split_at
 
 
+#: Páginas internas decodificadas que `BPlusTree` conserva para los descensos.
+INTERNAL_CACHE_PAGES = 1024
+
+
 class BPlusTree:
     """Árbol B+ persistente: índice primario clave -> valor sobre un
     `BufferPool`. La página 0 del dispositivo subyacente son siempre los
@@ -636,30 +832,69 @@ class BPlusTree:
 
     def __init__(self, buffer_pool: BufferPool) -> None:
         self._pool = buffer_pool
+        # Páginas internas ya decodificadas, sólo para los descensos (que no
+        # las modifican): cada inserción baja por 3-4 de ellas y decodificarlas
+        # era el 35 % de una carga masiva. Toda escritura del árbol pasa por
+        # `_put_page`, que invalida la entrada; los caminos que modifican un
+        # nodo (splits, fusiones) siguen decodificando su propia copia.
+        self._internal_cache: OrderedDict[PageId, InternalPage] = OrderedDict()
         if self._pool.page_count() == 0:
             self._bootstrap()
+        elif self._pool.get_page(METADATA_PAGE_ID) == bytes(PAGE_SIZE):
+            # `allocate_page` escribe ceros; una página de metadatos a cero
+            # significa que el primer flush del árbol nunca terminó (crash
+            # durante la creación): no hay nada persistido que conservar.
+            self._bootstrap(reuse_allocated=True)
         self._metadata = decode_metadata_page(self._pool.get_page(METADATA_PAGE_ID))
+        # Lo último escrito en la página de metadatos: `_save_metadata` no la
+        # reescribe si no cambia (cada inserción la guardaba, idéntica).
+        self._written_metadata: TreeMetadata | None = self._metadata
 
-    def _bootstrap(self) -> None:
-        metadata_page_id = self._pool.allocate_page()
-        root_page_id = self._pool.allocate_page()
+    def _bootstrap(self, *, reuse_allocated: bool = False) -> None:
+        if reuse_allocated:
+            metadata_page_id = METADATA_PAGE_ID
+            root_page_id = 1 if self._pool.page_count() > 1 else self._pool.allocate_page()
+        else:
+            metadata_page_id = self._pool.allocate_page()
+            root_page_id = self._pool.allocate_page()
         if metadata_page_id != METADATA_PAGE_ID:
             raise TreeInvariantError(
                 f"la página de metadatos debía asignarse como {METADATA_PAGE_ID}, "
                 f"se asignó {metadata_page_id}"
             )
-        self._pool.put_page(root_page_id, encode_leaf_page([], next_leaf=NULL_PAGE_ID))
+        self._put_page(root_page_id, encode_leaf_page([], next_leaf=NULL_PAGE_ID))
         metadata = TreeMetadata(root_page_id=root_page_id, page_count=self._pool.page_count())
-        self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
+        self._put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
         self._pool.flush()
 
     def _save_metadata(self, root_page_id: PageId) -> None:
-        self._metadata = TreeMetadata(
+        metadata = TreeMetadata(
             root_page_id=root_page_id,
             page_count=self._pool.page_count(),
             free_page_head=self._metadata.free_page_head,
         )
-        self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(self._metadata))
+        self._metadata = metadata
+        if metadata == self._written_metadata:
+            return  # la página ya tiene exactamente este contenido
+        self._put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
+        self._written_metadata = metadata
+
+    def _put_page(self, page_id: PageId, data: bytes) -> None:
+        self._internal_cache.pop(page_id, None)
+        self._pool.put_page(page_id, data)
+
+    def _descend_internal(self, page_id: PageId, raw: bytes) -> InternalPage:
+        """La página interna `page_id` decodificada, desde la caché si está.
+        Sólo para lectura: el objeto devuelto se comparte entre llamadas."""
+        cached = self._internal_cache.get(page_id)
+        if cached is not None:
+            self._internal_cache.move_to_end(page_id)
+            return cached
+        node = decode_internal_page(raw)
+        self._internal_cache[page_id] = node
+        if len(self._internal_cache) > INTERNAL_CACHE_PAGES:
+            self._internal_cache.popitem(last=False)
+        return node
 
     @property
     def metadata(self) -> TreeMetadata:
@@ -691,7 +926,7 @@ class BPlusTree:
                 if index < len(leaf.entries) and leaf.entries[index].key == key:
                     return leaf.entries[index].value
                 return None
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
             page_id = (
                 internal.entries[index].left_child
@@ -724,7 +959,7 @@ class BPlusTree:
             raw = self._pool.get_page(page_id)
             if _peek_page_type(raw) is PageType.LEAF:
                 return page_id
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             if start is None:
                 page_id = (
                     internal.entries[0].left_child if internal.entries else internal.side_pointer
@@ -750,7 +985,7 @@ class BPlusTree:
             raw = self._pool.get_page(page_id)
             if _peek_page_type(raw) is PageType.LEAF:
                 break
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
             path.append((page_id, index))
             page_id = (
@@ -767,7 +1002,7 @@ class BPlusTree:
             leaf.entries.insert(index, LeafEntry(key=key, value=value))
 
         if leaf_page_size(leaf.entries) <= PAGE_SIZE:
-            self._pool.put_page(page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+            self._put_page(page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
             self._save_metadata(self._metadata.root_page_id)
             return
 
@@ -777,10 +1012,10 @@ class BPlusTree:
         separator_key = right_entries[0].key
 
         new_leaf_page_id = self._pool.allocate_page()
-        self._pool.put_page(
+        self._put_page(
             new_leaf_page_id, encode_leaf_page(right_entries, next_leaf=leaf.side_pointer)
         )
-        self._pool.put_page(page_id, encode_leaf_page(left_entries, next_leaf=new_leaf_page_id))
+        self._put_page(page_id, encode_leaf_page(left_entries, next_leaf=new_leaf_page_id))
 
         self._propagate_split(path, separator_key, page_id, new_leaf_page_id)
         self._save_metadata(self._metadata.root_page_id)
@@ -815,7 +1050,7 @@ class BPlusTree:
             )
 
             if internal_page_size(parent.entries) <= PAGE_SIZE:
-                self._pool.put_page(
+                self._put_page(
                     parent_page_id, encode_internal_page(parent.entries, parent.side_pointer)
                 )
                 return
@@ -826,12 +1061,10 @@ class BPlusTree:
             right_entries = parent.entries[split_at + 1 :]
 
             new_right_page_id = self._pool.allocate_page()
-            self._pool.put_page(
+            self._put_page(
                 new_right_page_id, encode_internal_page(right_entries, parent.side_pointer)
             )
-            self._pool.put_page(
-                parent_page_id, encode_internal_page(left_entries, promoted.left_child)
-            )
+            self._put_page(parent_page_id, encode_internal_page(left_entries, promoted.left_child))
 
             separator_key = promoted.key
             left_page_id = parent_page_id
@@ -839,7 +1072,7 @@ class BPlusTree:
 
         new_root_page_id = self._pool.allocate_page()
         new_root_entries = [InternalEntry(key=separator_key, left_child=left_page_id)]
-        self._pool.put_page(new_root_page_id, encode_internal_page(new_root_entries, right_page_id))
+        self._put_page(new_root_page_id, encode_internal_page(new_root_entries, right_page_id))
         self._metadata = TreeMetadata(
             root_page_id=new_root_page_id,
             page_count=self._metadata.page_count,
@@ -867,7 +1100,7 @@ class BPlusTree:
             raw = self._pool.get_page(page_id)
             if _peek_page_type(raw) is PageType.LEAF:
                 break
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
             path.append((page_id, index))
             page_id = (
@@ -924,7 +1157,7 @@ class BPlusTree:
         self, path: list[tuple[PageId, int]], leaf_page_id: PageId, leaf: LeafPage
     ) -> None:
         if not path or leaf_page_size(leaf.entries) >= _UNDERFLOW_THRESHOLD:
-            self._pool.put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+            self._put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
             return
 
         parent_page_id, descend_index = path[-1]
@@ -935,7 +1168,7 @@ class BPlusTree:
             left_leaf = decode_leaf_page(self._pool.get_page(left_sibling_id))
             merged = left_leaf.entries + leaf.entries
             if leaf_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
+                self._put_page(
                     left_sibling_id, encode_leaf_page(merged, next_leaf=leaf.side_pointer)
                 )
                 self._remove_separator_and_retarget(parent, descend_index - 1, left_sibling_id)
@@ -946,14 +1179,14 @@ class BPlusTree:
             right_leaf = decode_leaf_page(self._pool.get_page(right_sibling_id))
             merged = leaf.entries + right_leaf.entries
             if leaf_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
+                self._put_page(
                     leaf_page_id, encode_leaf_page(merged, next_leaf=right_leaf.side_pointer)
                 )
                 self._remove_separator_and_retarget(parent, descend_index, leaf_page_id)
                 self._rebalance_internal(path[:-1], parent_page_id, parent)
                 return
 
-        self._pool.put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+        self._put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
 
     def _rebalance_internal(
         self, path: list[tuple[PageId, int]], node_page_id: PageId, node: InternalPage
@@ -971,11 +1204,11 @@ class BPlusTree:
                     free_page_head=self._metadata.free_page_head,
                 )
                 return
-            self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+            self._put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
             return
 
         if internal_page_size(node.entries) >= _UNDERFLOW_THRESHOLD:
-            self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+            self._put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
             return
 
         parent_page_id, descend_index = path[-1]
@@ -988,9 +1221,7 @@ class BPlusTree:
             pulled_down = InternalEntry(key=separator_key, left_child=left_node.side_pointer)
             merged = [*left_node.entries, pulled_down, *node.entries]
             if internal_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
-                    left_sibling_id, encode_internal_page(merged, node.side_pointer)
-                )
+                self._put_page(left_sibling_id, encode_internal_page(merged, node.side_pointer))
                 self._remove_separator_and_retarget(parent, descend_index - 1, left_sibling_id)
                 self._rebalance_internal(path[:-1], parent_page_id, parent)
                 return
@@ -1001,11 +1232,9 @@ class BPlusTree:
             pulled_down = InternalEntry(key=separator_key, left_child=node.side_pointer)
             merged = [*node.entries, pulled_down, *right_node.entries]
             if internal_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
-                    node_page_id, encode_internal_page(merged, right_node.side_pointer)
-                )
+                self._put_page(node_page_id, encode_internal_page(merged, right_node.side_pointer))
                 self._remove_separator_and_retarget(parent, descend_index, node_page_id)
                 self._rebalance_internal(path[:-1], parent_page_id, parent)
                 return
 
-        self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+        self._put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))

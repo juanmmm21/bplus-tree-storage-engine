@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bplus-tree-storage-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "A disk-backed B+Tree storage engine with buffer pool management and page-level indexing, built from scratch."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,7 +18,10 @@ Repository = "https://github.com/juanmmm21/bplus-tree-storage-engine"
 bplus-tree-storage-engine = "bplus_tree_storage_engine.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "mypy>=1.10", "ruff>=0.6"]
+dev = ["pytest>=8.0", "mypy>=1.10", "ruff>=0.6", "hypothesis>=6.100"]
+# Acelerador Rust opcional del códec de páginas (paquete aparte en native/,
+# se construye con maturin; wheels de CI para Linux x86_64 y macOS arm64).
+native = ["bplus-tree-storage-engine-native>=0.2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bplus_tree_storage_engine"]
