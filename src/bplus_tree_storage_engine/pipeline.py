@@ -819,6 +819,10 @@ def _find_internal_split_point(entries: list[InternalEntry]) -> int:
     return split_at
 
 
+#: Páginas internas decodificadas que `BPlusTree` conserva para los descensos.
+INTERNAL_CACHE_PAGES = 1024
+
+
 class BPlusTree:
     """Árbol B+ persistente: índice primario clave -> valor sobre un
     `BufferPool`. La página 0 del dispositivo subyacente son siempre los
@@ -828,6 +832,12 @@ class BPlusTree:
 
     def __init__(self, buffer_pool: BufferPool) -> None:
         self._pool = buffer_pool
+        # Páginas internas ya decodificadas, sólo para los descensos (que no
+        # las modifican): cada inserción baja por 3-4 de ellas y decodificarlas
+        # era el 35 % de una carga masiva. Toda escritura del árbol pasa por
+        # `_put_page`, que invalida la entrada; los caminos que modifican un
+        # nodo (splits, fusiones) siguen decodificando su propia copia.
+        self._internal_cache: OrderedDict[PageId, InternalPage] = OrderedDict()
         if self._pool.page_count() == 0:
             self._bootstrap()
         elif self._pool.get_page(METADATA_PAGE_ID) == bytes(PAGE_SIZE):
@@ -836,6 +846,9 @@ class BPlusTree:
             # durante la creación): no hay nada persistido que conservar.
             self._bootstrap(reuse_allocated=True)
         self._metadata = decode_metadata_page(self._pool.get_page(METADATA_PAGE_ID))
+        # Lo último escrito en la página de metadatos: `_save_metadata` no la
+        # reescribe si no cambia (cada inserción la guardaba, idéntica).
+        self._written_metadata: TreeMetadata | None = self._metadata
 
     def _bootstrap(self, *, reuse_allocated: bool = False) -> None:
         if reuse_allocated:
@@ -849,18 +862,39 @@ class BPlusTree:
                 f"la página de metadatos debía asignarse como {METADATA_PAGE_ID}, "
                 f"se asignó {metadata_page_id}"
             )
-        self._pool.put_page(root_page_id, encode_leaf_page([], next_leaf=NULL_PAGE_ID))
+        self._put_page(root_page_id, encode_leaf_page([], next_leaf=NULL_PAGE_ID))
         metadata = TreeMetadata(root_page_id=root_page_id, page_count=self._pool.page_count())
-        self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
+        self._put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
         self._pool.flush()
 
     def _save_metadata(self, root_page_id: PageId) -> None:
-        self._metadata = TreeMetadata(
+        metadata = TreeMetadata(
             root_page_id=root_page_id,
             page_count=self._pool.page_count(),
             free_page_head=self._metadata.free_page_head,
         )
-        self._pool.put_page(METADATA_PAGE_ID, encode_metadata_page(self._metadata))
+        self._metadata = metadata
+        if metadata == self._written_metadata:
+            return  # la página ya tiene exactamente este contenido
+        self._put_page(METADATA_PAGE_ID, encode_metadata_page(metadata))
+        self._written_metadata = metadata
+
+    def _put_page(self, page_id: PageId, data: bytes) -> None:
+        self._internal_cache.pop(page_id, None)
+        self._pool.put_page(page_id, data)
+
+    def _descend_internal(self, page_id: PageId, raw: bytes) -> InternalPage:
+        """La página interna `page_id` decodificada, desde la caché si está.
+        Sólo para lectura: el objeto devuelto se comparte entre llamadas."""
+        cached = self._internal_cache.get(page_id)
+        if cached is not None:
+            self._internal_cache.move_to_end(page_id)
+            return cached
+        node = decode_internal_page(raw)
+        self._internal_cache[page_id] = node
+        if len(self._internal_cache) > INTERNAL_CACHE_PAGES:
+            self._internal_cache.popitem(last=False)
+        return node
 
     @property
     def metadata(self) -> TreeMetadata:
@@ -892,7 +926,7 @@ class BPlusTree:
                 if index < len(leaf.entries) and leaf.entries[index].key == key:
                     return leaf.entries[index].value
                 return None
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
             page_id = (
                 internal.entries[index].left_child
@@ -925,7 +959,7 @@ class BPlusTree:
             raw = self._pool.get_page(page_id)
             if _peek_page_type(raw) is PageType.LEAF:
                 return page_id
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             if start is None:
                 page_id = (
                     internal.entries[0].left_child if internal.entries else internal.side_pointer
@@ -951,7 +985,7 @@ class BPlusTree:
             raw = self._pool.get_page(page_id)
             if _peek_page_type(raw) is PageType.LEAF:
                 break
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
             path.append((page_id, index))
             page_id = (
@@ -968,7 +1002,7 @@ class BPlusTree:
             leaf.entries.insert(index, LeafEntry(key=key, value=value))
 
         if leaf_page_size(leaf.entries) <= PAGE_SIZE:
-            self._pool.put_page(page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+            self._put_page(page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
             self._save_metadata(self._metadata.root_page_id)
             return
 
@@ -978,10 +1012,10 @@ class BPlusTree:
         separator_key = right_entries[0].key
 
         new_leaf_page_id = self._pool.allocate_page()
-        self._pool.put_page(
+        self._put_page(
             new_leaf_page_id, encode_leaf_page(right_entries, next_leaf=leaf.side_pointer)
         )
-        self._pool.put_page(page_id, encode_leaf_page(left_entries, next_leaf=new_leaf_page_id))
+        self._put_page(page_id, encode_leaf_page(left_entries, next_leaf=new_leaf_page_id))
 
         self._propagate_split(path, separator_key, page_id, new_leaf_page_id)
         self._save_metadata(self._metadata.root_page_id)
@@ -1016,7 +1050,7 @@ class BPlusTree:
             )
 
             if internal_page_size(parent.entries) <= PAGE_SIZE:
-                self._pool.put_page(
+                self._put_page(
                     parent_page_id, encode_internal_page(parent.entries, parent.side_pointer)
                 )
                 return
@@ -1027,12 +1061,10 @@ class BPlusTree:
             right_entries = parent.entries[split_at + 1 :]
 
             new_right_page_id = self._pool.allocate_page()
-            self._pool.put_page(
+            self._put_page(
                 new_right_page_id, encode_internal_page(right_entries, parent.side_pointer)
             )
-            self._pool.put_page(
-                parent_page_id, encode_internal_page(left_entries, promoted.left_child)
-            )
+            self._put_page(parent_page_id, encode_internal_page(left_entries, promoted.left_child))
 
             separator_key = promoted.key
             left_page_id = parent_page_id
@@ -1040,7 +1072,7 @@ class BPlusTree:
 
         new_root_page_id = self._pool.allocate_page()
         new_root_entries = [InternalEntry(key=separator_key, left_child=left_page_id)]
-        self._pool.put_page(new_root_page_id, encode_internal_page(new_root_entries, right_page_id))
+        self._put_page(new_root_page_id, encode_internal_page(new_root_entries, right_page_id))
         self._metadata = TreeMetadata(
             root_page_id=new_root_page_id,
             page_count=self._metadata.page_count,
@@ -1068,7 +1100,7 @@ class BPlusTree:
             raw = self._pool.get_page(page_id)
             if _peek_page_type(raw) is PageType.LEAF:
                 break
-            internal = decode_internal_page(raw)
+            internal = self._descend_internal(page_id, raw)
             index = bisect.bisect_right(internal.entries, key, key=lambda entry: entry.key)
             path.append((page_id, index))
             page_id = (
@@ -1125,7 +1157,7 @@ class BPlusTree:
         self, path: list[tuple[PageId, int]], leaf_page_id: PageId, leaf: LeafPage
     ) -> None:
         if not path or leaf_page_size(leaf.entries) >= _UNDERFLOW_THRESHOLD:
-            self._pool.put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+            self._put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
             return
 
         parent_page_id, descend_index = path[-1]
@@ -1136,7 +1168,7 @@ class BPlusTree:
             left_leaf = decode_leaf_page(self._pool.get_page(left_sibling_id))
             merged = left_leaf.entries + leaf.entries
             if leaf_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
+                self._put_page(
                     left_sibling_id, encode_leaf_page(merged, next_leaf=leaf.side_pointer)
                 )
                 self._remove_separator_and_retarget(parent, descend_index - 1, left_sibling_id)
@@ -1147,14 +1179,14 @@ class BPlusTree:
             right_leaf = decode_leaf_page(self._pool.get_page(right_sibling_id))
             merged = leaf.entries + right_leaf.entries
             if leaf_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
+                self._put_page(
                     leaf_page_id, encode_leaf_page(merged, next_leaf=right_leaf.side_pointer)
                 )
                 self._remove_separator_and_retarget(parent, descend_index, leaf_page_id)
                 self._rebalance_internal(path[:-1], parent_page_id, parent)
                 return
 
-        self._pool.put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
+        self._put_page(leaf_page_id, encode_leaf_page(leaf.entries, leaf.side_pointer))
 
     def _rebalance_internal(
         self, path: list[tuple[PageId, int]], node_page_id: PageId, node: InternalPage
@@ -1172,11 +1204,11 @@ class BPlusTree:
                     free_page_head=self._metadata.free_page_head,
                 )
                 return
-            self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+            self._put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
             return
 
         if internal_page_size(node.entries) >= _UNDERFLOW_THRESHOLD:
-            self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+            self._put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
             return
 
         parent_page_id, descend_index = path[-1]
@@ -1189,9 +1221,7 @@ class BPlusTree:
             pulled_down = InternalEntry(key=separator_key, left_child=left_node.side_pointer)
             merged = [*left_node.entries, pulled_down, *node.entries]
             if internal_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
-                    left_sibling_id, encode_internal_page(merged, node.side_pointer)
-                )
+                self._put_page(left_sibling_id, encode_internal_page(merged, node.side_pointer))
                 self._remove_separator_and_retarget(parent, descend_index - 1, left_sibling_id)
                 self._rebalance_internal(path[:-1], parent_page_id, parent)
                 return
@@ -1202,11 +1232,9 @@ class BPlusTree:
             pulled_down = InternalEntry(key=separator_key, left_child=node.side_pointer)
             merged = [*node.entries, pulled_down, *right_node.entries]
             if internal_page_size(merged) <= PAGE_SIZE:
-                self._pool.put_page(
-                    node_page_id, encode_internal_page(merged, right_node.side_pointer)
-                )
+                self._put_page(node_page_id, encode_internal_page(merged, right_node.side_pointer))
                 self._remove_separator_and_retarget(parent, descend_index, node_page_id)
                 self._rebalance_internal(path[:-1], parent_page_id, parent)
                 return
 
-        self._pool.put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
+        self._put_page(node_page_id, encode_internal_page(node.entries, node.side_pointer))
