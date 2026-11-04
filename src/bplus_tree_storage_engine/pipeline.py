@@ -20,6 +20,7 @@ serializarlo en su propia capa antes de llamar a estas clases.
 from __future__ import annotations
 
 import bisect
+import importlib
 import io
 import os
 import struct
@@ -28,7 +29,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from bplus_tree_storage_engine.models import (
     CELL_POINTER_FORMAT,
@@ -223,7 +224,55 @@ def encode_leaf_page(entries: list[LeafEntry], next_leaf: PageId = NULL_PAGE_ID)
     return _assemble_page(PageType.LEAF, cells, next_leaf)
 
 
+# --- Acelerador nativo opcional ------------------------------------------------
+#
+# `bplus-tree-storage-engine-native` (crate PyO3 en `native/`) decodifica las
+# páginas hoja e internas en Rust. Es opcional: sin él, o con
+# `BPLUS_TREE_PURE_PYTHON=1`, todo funciona igual en Python puro. Contrato:
+# el camino nativo sólo acepta páginas válidas y en rango; ante cualquier
+# anomalía devuelve `None` y se usa la implementación Python de referencia,
+# que produce el resultado o el error exacto de siempre. Los tests de
+# propiedades comparan ambos caminos sobre páginas aleatorias y corruptas.
+
+
+def _load_native() -> Any:
+    if os.environ.get("BPLUS_TREE_PURE_PYTHON"):
+        return None
+    try:
+        return importlib.import_module("bplus_tree_native")
+    except ImportError:
+        return None
+
+
+_native: Any = _load_native()
+NATIVE_CODEC = _native is not None
+
+
 def decode_leaf_page(data: bytes) -> LeafPage:
+    if _native is not None and type(data) is bytes:
+        decoded = _native.decode_leaf_cells(data)
+        if decoded is not None:
+            side_pointer, pairs = decoded
+            return LeafPage(
+                side_pointer=side_pointer,
+                entries=[LeafEntry.trusted(key, value) for key, value in pairs],
+            )
+    return _decode_leaf_page_python(data)
+
+
+def decode_internal_page(data: bytes) -> InternalPage:
+    if _native is not None and type(data) is bytes:
+        decoded = _native.decode_internal_cells(data)
+        if decoded is not None:
+            side_pointer, pairs = decoded
+            return InternalPage(
+                side_pointer=side_pointer,
+                entries=[InternalEntry.trusted(key, child) for key, child in pairs],
+            )
+    return _decode_internal_page_python(data)
+
+
+def _decode_leaf_page_python(data: bytes) -> LeafPage:
     header, cells = _disassemble_page(data, PageType.LEAF)
     entries: list[LeafEntry] = []
     for cell in cells:
@@ -252,7 +301,7 @@ def encode_internal_page(entries: list[InternalEntry], rightmost_child: PageId) 
     return _assemble_page(PageType.INTERNAL, cells, rightmost_child)
 
 
-def decode_internal_page(data: bytes) -> InternalPage:
+def _decode_internal_page_python(data: bytes) -> InternalPage:
     header, cells = _disassemble_page(data, PageType.INTERNAL)
     entries: list[InternalEntry] = []
     for cell in cells:

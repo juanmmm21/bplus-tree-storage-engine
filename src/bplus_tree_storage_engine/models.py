@@ -108,6 +108,16 @@ class LeafEntry:
         if len(self.key) == 0:
             raise ValueError("la clave no puede estar vacía")
 
+    @classmethod
+    def trusted(cls, key: bytes, value: bytes) -> LeafEntry:
+        """Construcción sin `__post_init__`, sólo para el decodificador
+        nativo, que ya garantizó la única condición que valida (clave no
+        vacía): ahorra una llamada Python por entrada decodificada."""
+        entry = object.__new__(cls)
+        object.__setattr__(entry, "key", key)
+        object.__setattr__(entry, "value", value)
+        return entry
+
 
 @dataclass(frozen=True, slots=True)
 class InternalEntry:
@@ -125,6 +135,15 @@ class InternalEntry:
             raise ValueError("la clave separadora no puede estar vacía")
         if self.left_child < 0:
             raise ValueError(f"left_child debe ser >= 0, recibido {self.left_child}")
+
+    @classmethod
+    def trusted(cls, key: bytes, left_child: PageId) -> InternalEntry:
+        """Como `LeafEntry.trusted`: el decodificador nativo ya garantizó
+        clave no vacía y `left_child >= 0` (es un u32)."""
+        entry = object.__new__(cls)
+        object.__setattr__(entry, "key", key)
+        object.__setattr__(entry, "left_child", left_child)
+        return entry
 
 
 @dataclass(frozen=True, slots=True)

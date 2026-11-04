@@ -38,3 +38,4 @@ START_HERE.md
 *.sqlite3
 /data/
 /logs/
+native/target/

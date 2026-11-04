@@ -74,6 +74,43 @@ Page 0 is always a metadata page (`root_page_id`, `page_count`, `free_page_head`
 
 Deleting an entry does not enforce a strict minimum occupancy for correctness — a sparse B+Tree is still a perfectly valid, searchable one. As an optimization, a page that drops under half-full after a delete tries to merge into an immediate sibling under the same parent (left first, then right); if neither sibling has room, the page is simply left as-is. Redistribution (borrowing a single entry from a sibling instead of merging) is intentionally not implemented: it would cover a few more cases where a full merge doesn't fit, at the cost of a real extra edge case (a borrowed key could grow the parent's separator past what it had room for), for a benefit that is purely about compactness, not correctness.
 
+### Optional Rust accelerator for the page codec
+
+Profiling nanosql on a TPC-H-like workload put this engine's page decoding
+at the top of the component code: during a bulk load,
+`decode_internal_page` + `_disassemble_page` + entry validation took ~45%
+of the time (every insert descends the tree decoding internal pages), and
+`decode_leaf_page` 13–17% of every scan-bound query. The package
+`bplus-tree-storage-engine-native` (in `native/`: Rust, PyO3, built with
+maturin, abi3 wheels for CPython ≥ 3.11) implements those two decoders.
+
+It is strictly optional: `pip install ".[native]"` (or a wheel from CI)
+enables it, `BPLUS_TREE_PURE_PYTHON=1` disables it, and without it
+everything runs in pure Python as before (`pipeline.NATIVE_CODEC` tells
+which path is active). Equivalence is by construction: the Rust decoder
+only accepts pages that are valid and in range — size, magic, version,
+type, CRC32, cell pointers, lengths, non-empty keys — and returns `None`
+for anything else, in which case the Python reference decoder runs and
+produces the exact result or error it always did. Hypothesis properties
+(`tests/test_native_codec.py`) check that valid pages decode identically,
+that mutated pages and arbitrary garbage give the same result or the same
+exception type and message through both paths, and that whenever the
+native decoder accepts a page its output equals Python's. CI builds the
+wheels for Linux x86_64 and macOS arm64 and runs the whole suite with and
+without the accelerator.
+
+Measured in this session (Intel Xeon @ 2.10 GHz, Python 3.13.18, rustc
+1.97.0, release build), best of 5 × 3,000 decodes:
+
+| page | pure Python | native | speedup |
+|---|---:|---:|---:|
+| leaf, 25 nanosql-shaped entries (~120 B each) | 26.4 µs | 8.5 µs | 3.1× |
+| internal, 100 separator keys | 81.3 µs | 31.3 µs | 2.6× |
+
+What remains on the native path is creating the Python objects for each
+entry. The whole test suite of this repository runs in 13.1 s with the
+accelerator and 19.6 s without it.
+
 ## Architecture
 
 ```text
