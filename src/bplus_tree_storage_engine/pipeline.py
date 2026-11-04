@@ -60,7 +60,7 @@ from bplus_tree_storage_engine.models import (
     TreeMetadata,
     TruncatedPageError,
 )
-from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
+from bplus_tree_storage_engine.protocols import AtomicPageDevice, PageDevice, ReplacementPolicy
 
 _CHECKSUM_SIZE = struct.calcsize(">I")
 _CHECKSUM_OFFSET = HEADER_SIZE - _CHECKSUM_SIZE
@@ -351,6 +351,56 @@ def decode_metadata_page(data: bytes) -> TreeMetadata:
     )
 
 
+# Diario de doble escritura de `FilePageDevice.write_pages_atomically`:
+# cabecera (magic, versión, nº de páginas), registros (page_id + página) y
+# un CRC32 final de todo lo anterior. Un diario incompleto o con CRC
+# erróneo es el rastro de un crash *antes* de empezar las escrituras en su
+# sitio, así que se descarta; uno completo se re-aplica entero.
+_JOURNAL_MAGIC = b"BPTJ"
+_JOURNAL_VERSION = 1
+_JOURNAL_HEADER = struct.Struct(">4sII")
+_JOURNAL_PAGE_ID = struct.Struct(">I")
+_JOURNAL_CRC = struct.Struct(">I")
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Hace durable la creación o el borrado de una entrada del directorio
+    (el diario). En Windows no hay descriptores de directorio: no aplica."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise StorageIOError(f"fallo de E/S en fsync del directorio {directory}: {exc}") from exc
+
+
+def _parse_journal(data: bytes) -> list[tuple[PageId, bytes]] | None:
+    """Páginas de un diario completo y válido, o `None` si está a medias."""
+    if len(data) < _JOURNAL_HEADER.size + _JOURNAL_CRC.size:
+        return None
+    magic, version, count = _JOURNAL_HEADER.unpack_from(data, 0)
+    record = _JOURNAL_PAGE_ID.size + PAGE_SIZE
+    if magic != _JOURNAL_MAGIC or version != _JOURNAL_VERSION:
+        return None
+    if len(data) != _JOURNAL_HEADER.size + count * record + _JOURNAL_CRC.size:
+        return None
+    (stored,) = _JOURNAL_CRC.unpack_from(data, len(data) - _JOURNAL_CRC.size)
+    if zlib.crc32(data[: -_JOURNAL_CRC.size]) & 0xFFFFFFFF != stored:
+        return None
+    pages: list[tuple[PageId, bytes]] = []
+    offset = _JOURNAL_HEADER.size
+    for _ in range(count):
+        (page_id,) = _JOURNAL_PAGE_ID.unpack_from(data, offset)
+        offset += _JOURNAL_PAGE_ID.size
+        pages.append((PageId(page_id), data[offset : offset + PAGE_SIZE]))
+        offset += PAGE_SIZE
+    return pages
+
+
 class FilePageDevice:
     """`PageDevice` respaldado por un archivo real en disco.
 
@@ -359,16 +409,72 @@ class FilePageDevice:
     o `allocate_page` interrumpido a mitad (proceso matado durante la
     escritura) y se reporta como `TruncatedPageError` en vez de arrancar
     con datos parciales silenciosamente.
+
+    También es un `AtomicPageDevice`: `write_pages_atomically` escribe el
+    lote primero en un diario al lado (`<archivo>.journal`, con fsync) y
+    sólo después en su sitio. Al abrir, un diario completo se re-aplica y
+    uno a medias se descarta, así que un crash en cualquier punto deja el
+    lote entero o nada de él.
     """
 
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
+        self._journal_path = self._path.with_name(self._path.name + ".journal")
         mode = "r+b" if self._path.exists() else "w+b"
         try:
             self._file: IO[bytes] = open(self._path, mode)  # noqa: SIM115 (cerrado en close())
         except OSError as exc:
             raise StorageIOError(f"no se pudo abrir {self._path}: {exc}") from exc
+        self._recover_journal()
         self._page_count = self._read_page_count_from_file_size()
+
+    def _recover_journal(self) -> None:
+        if not self._journal_path.exists():
+            return
+        try:
+            pages = _parse_journal(self._journal_path.read_bytes())
+            if pages is not None:
+                for page_id, data in pages:
+                    self._file.seek(page_id * PAGE_SIZE)
+                    self._file.write(data)
+                self._file.flush()
+                os.fsync(self._file.fileno())
+            self._journal_path.unlink()
+        except OSError as exc:
+            raise StorageIOError(f"fallo de E/S recuperando {self._journal_path}: {exc}") from exc
+        _fsync_directory(self._path.parent)
+
+    def write_pages_atomically(self, pages: list[tuple[PageId, bytes]]) -> None:
+        if not pages:
+            self.sync()
+            return
+        parts = [_JOURNAL_HEADER.pack(_JOURNAL_MAGIC, _JOURNAL_VERSION, len(pages))]
+        for page_id, data in pages:
+            if len(data) != PAGE_SIZE:
+                raise ValueError(f"write_page requiere {PAGE_SIZE} bytes, recibidos {len(data)}")
+            if page_id >= self._page_count:
+                raise ValueError(f"write_page en página {page_id} no asignada aún")
+            parts += [_JOURNAL_PAGE_ID.pack(page_id), data]
+        body = b"".join(parts)
+        blob = body + _JOURNAL_CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
+        try:
+            with open(self._journal_path, "wb") as journal:
+                journal.write(blob)
+                journal.flush()
+                os.fsync(journal.fileno())
+        except OSError as exc:
+            raise StorageIOError(f"fallo de E/S escribiendo {self._journal_path}: {exc}") from exc
+        _fsync_directory(self._path.parent)
+        # Desde aquí el lote sobrevive a cualquier crash: lo que no llegue a
+        # escribirse en su sitio lo re-aplica `_recover_journal` al abrir.
+        for page_id, data in pages:
+            self.write_page(page_id, data)
+        self.sync()
+        try:
+            self._journal_path.unlink()
+        except OSError as exc:
+            raise StorageIOError(f"fallo de E/S borrando {self._journal_path}: {exc}") from exc
+        _fsync_directory(self._path.parent)
 
     def _read_page_count_from_file_size(self) -> int:
         try:
@@ -524,6 +630,7 @@ class BufferPool:
     ) -> None:
         self._device = device
         self._capacity = config.capacity
+        self._crash_consistent = config.crash_consistent
         self._policy: ReplacementPolicy = (
             replacement_policy if replacement_policy is not None else LruReplacementPolicy()
         )
@@ -561,6 +668,9 @@ class BufferPool:
         self._cache[page_id] = entry
 
     def _evict_one(self) -> None:
+        if self._crash_consistent:
+            self._evict_one_clean()
+            return
         victim = self._policy.choose_victim()
         while victim is not None and victim not in self._cache:
             self._policy.forget(victim)
@@ -574,14 +684,47 @@ class BufferPool:
         if evicted.dirty:
             self._device.write_page(victim, bytes(evicted.data))
 
+    def _evict_one_clean(self) -> None:
+        """Desalojo *no-steal*: la víctima es la página limpia menos
+        reciente. Las sucias se rotan al final del orden sin escribirlas;
+        si todas lo están, no se desaloja nada y el pool crece por encima
+        de `capacity` hasta el próximo `flush()`."""
+        attempts = len(self._cache)
+        while attempts > 0:
+            victim = self._policy.choose_victim()
+            if victim is None:
+                return
+            if victim not in self._cache:
+                self._policy.forget(victim)
+                continue
+            attempts -= 1
+            if not self._cache[victim].dirty:
+                del self._cache[victim]
+                self._policy.forget(victim)
+                return
+            self._policy.record_access(victim)
+
     def flush(self) -> None:
         """Persiste todas las páginas sucias y fuerza `fsync` del
         dispositivo. Ninguna escritura se considera durable hasta que
-        este método retorna."""
-        for page_id, entry in self._cache.items():
-            if entry.dirty:
-                self._device.write_page(page_id, bytes(entry.data))
+        este método retorna. En modo `crash_consistent`, y si el
+        dispositivo es un `AtomicPageDevice`, el lote es atómico."""
+        dirty = [(page_id, entry) for page_id, entry in self._cache.items() if entry.dirty]
+        if self._crash_consistent and isinstance(self._device, AtomicPageDevice):
+            self._device.write_pages_atomically([(pid, bytes(e.data)) for pid, e in dirty])
+            for _, entry in dirty:
                 entry.dirty = False
+            # Lo que creció por encima de `capacity` por no-steal ya está
+            # limpio: se vuelve al tamaño configurado.
+            while len(self._cache) > self._capacity:
+                before = len(self._cache)
+                self._evict_one_clean()
+                if len(self._cache) == before:
+                    break
+            return
+        for page_id, entry in dirty:
+            self._device.write_page(page_id, bytes(entry.data))
+            entry.dirty = False
         self._device.sync()
 
     def close(self) -> None:
@@ -687,11 +830,20 @@ class BPlusTree:
         self._pool = buffer_pool
         if self._pool.page_count() == 0:
             self._bootstrap()
+        elif self._pool.get_page(METADATA_PAGE_ID) == bytes(PAGE_SIZE):
+            # `allocate_page` escribe ceros; una página de metadatos a cero
+            # significa que el primer flush del árbol nunca terminó (crash
+            # durante la creación): no hay nada persistido que conservar.
+            self._bootstrap(reuse_allocated=True)
         self._metadata = decode_metadata_page(self._pool.get_page(METADATA_PAGE_ID))
 
-    def _bootstrap(self) -> None:
-        metadata_page_id = self._pool.allocate_page()
-        root_page_id = self._pool.allocate_page()
+    def _bootstrap(self, *, reuse_allocated: bool = False) -> None:
+        if reuse_allocated:
+            metadata_page_id = METADATA_PAGE_ID
+            root_page_id = 1 if self._pool.page_count() > 1 else self._pool.allocate_page()
+        else:
+            metadata_page_id = self._pool.allocate_page()
+            root_page_id = self._pool.allocate_page()
         if metadata_page_id != METADATA_PAGE_ID:
             raise TreeInvariantError(
                 f"la página de metadatos debía asignarse como {METADATA_PAGE_ID}, "

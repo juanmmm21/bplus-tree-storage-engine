@@ -36,12 +36,13 @@ from bplus_tree_storage_engine.pipeline import (
     leaf_cell_size,
     page_free_space,
 )
-from bplus_tree_storage_engine.protocols import PageDevice, ReplacementPolicy
+from bplus_tree_storage_engine.protocols import AtomicPageDevice, PageDevice, ReplacementPolicy
 
 __all__ = [
     "BPlusTree",
     "BplusTreeError",
     "BufferPool",
+    "AtomicPageDevice",
     "BufferPoolConfig",
     "ChecksumMismatchError",
     "EntryTooLargeError",

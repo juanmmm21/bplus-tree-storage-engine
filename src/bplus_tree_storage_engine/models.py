@@ -167,9 +167,21 @@ class TreeMetadata:
 
 @dataclass(frozen=True, slots=True)
 class BufferPoolConfig:
-    """Configuración del buffer pool: tamaño máximo acotado y explícito."""
+    """Configuración del buffer pool: tamaño máximo acotado y explícito.
+
+    `crash_consistent=True` hace que el archivo sólo pase de un estado
+    flusheado al siguiente, nunca a una mezcla: (1) *no-steal*, una página
+    sucia no se desaloja al dispositivo antes del próximo `flush()` (si
+    todas las páginas en caché están sucias, el pool crece por encima de
+    `capacity` hasta ese flush), y (2) `flush()` escribe el lote completo de
+    forma atómica si el dispositivo lo admite (`AtomicPageDevice`, p.ej. el
+    diario de doble escritura de `FilePageDevice`). Es lo que necesita un
+    WAL lógico encima: rehacer operaciones sobre un árbol que un crash dejó
+    a medio split no funciona.
+    """
 
     capacity: int
+    crash_consistent: bool = False
 
     def __post_init__(self) -> None:
         if self.capacity < 1:

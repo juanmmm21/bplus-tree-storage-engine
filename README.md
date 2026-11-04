@@ -41,7 +41,7 @@ This repo does not import or depend on any other subproject: it exposes a versio
 - A realistic **slotted-page** binary layout (header + cell-pointer array + cell content growing from the end of the page), the same scheme used by SQLite and Postgres, instead of a naive fixed-slot format.
 - **Byte-size-aware splitting**: the split point is chosen by cumulative serialized size, not by entry count, so a page with wildly uneven key/value sizes still always splits into two pages that both fit — proven, not assumed (see `_find_leaf_split_point` / `_find_internal_split_point`).
 - Correct **cascading split propagation** up to the root (including root growth) and **opportunistic sibling merging** on delete (including root collapse when the tree shrinks by a level).
-- A **bounded buffer pool** with a pluggable `ReplacementPolicy` (LRU by default) and write-back semantics: dirty pages are only persisted on eviction, `flush()`, or `close()`.
+- A **bounded buffer pool** with a pluggable `ReplacementPolicy` (LRU by default) and write-back semantics: dirty pages are only persisted on eviction, `flush()`, or `close()` — or, in crash-consistent mode, only by an atomic, journaled `flush()`.
 - Page-level integrity: every page carries a version and a CRC32 checksum; truncation (a page cut short by a crash mid-write) and corruption (a flipped bit in an already-written page) are distinguished and reported as typed exceptions, never a silent misread.
 - Property-based tests with fixed-seed random insert/delete workloads that verify structural invariants (key order, correct range partitioning, leaf-chain completeness) after tens of thousands of operations.
 
@@ -73,6 +73,34 @@ Page 0 is always a metadata page (`root_page_id`, `page_count`, `free_page_head`
 ### Merging
 
 Deleting an entry does not enforce a strict minimum occupancy for correctness — a sparse B+Tree is still a perfectly valid, searchable one. As an optimization, a page that drops under half-full after a delete tries to merge into an immediate sibling under the same parent (left first, then right); if neither sibling has room, the page is simply left as-is. Redistribution (borrowing a single entry from a sibling instead of merging) is intentionally not implemented: it would cover a few more cases where a full merge doesn't fit, at the cost of a real extra edge case (a borrowed key could grow the parent's separator past what it had room for), for a benefit that is purely about compactness, not correctness.
+
+### Crash-consistent mode
+
+By default the buffer pool is *write-back with steal*: a dirty page can be written in place whenever
+it is evicted, and `flush()` writes the dirty pages one after another. That is fine for a process
+that exits cleanly, but a `kill -9` in the middle leaves a file that mixes two states — for example
+a parent that already points to a page created by a split while that page is still the zeros
+`allocate_page` wrote. A logical WAL above the tree (nanosql's) cannot repair that: replaying
+`put`s needs a structurally valid tree to descend.
+
+`BufferPoolConfig(capacity, crash_consistent=True)` makes the file move only from one completed
+flush to the next:
+
+- **No steal.** Eviction only takes clean pages; dirty pages are rotated, never written. If every
+  cached page is dirty the pool grows past `capacity` until the next `flush()`, then shrinks back.
+- **Atomic flush.** On an `AtomicPageDevice` (`FilePageDevice` is one) the whole batch is written
+  first to `<file>.journal` — header, `page_id` + page records, CRC32 — and fsynced (file and
+  directory), and only then in place. On open, a complete journal is replayed and a torn one is
+  discarded (the crash came before any in-place write), so the batch is all or nothing.
+- A metadata page that is still all zeros means the first flush never finished; the tree is
+  bootstrapped again instead of failing to decode it.
+
+`tests/test_crash_consistency.py` crashes a multi-page flush before *every* in-place write (with
+the unflushed userspace buffer lost and with it written) and checks that reopening always yields
+exactly the new state, plus torn and complete journals, no-steal with a tiny pool, and a file
+killed before its first flush. The same tests run in the default mode fail, which is why nanosql
+opens its on-disk B+Tree with `crash_consistent=True`. The cost is a second write of every dirty
+page per flush and a pool that can temporarily exceed its capacity.
 
 ### Optional Rust accelerator for the page codec
 
@@ -123,7 +151,7 @@ src/bplus_tree_storage_engine/
 ```
 
 - **`models.py`** — immutable data types (`dataclass(frozen=True, slots=True)`) and the exception hierarchy (`BplusTreeError` → `StorageIOError` / `PageCorruptionError` → `InvalidPageError` / `ChecksumMismatchError` / `TruncatedPageError`, plus `EntryTooLargeError`, `KeyNotFoundError`, `TreeInvariantError`).
-- **`protocols.py`** — `PageDevice` (the raw page storage contract; `FilePageDevice` and `InMemoryPageDevice` both implement it) and `ReplacementPolicy` (the buffer pool's eviction contract; `LruReplacementPolicy` implements it).
+- **`protocols.py`** — `PageDevice` (the raw page storage contract; `FilePageDevice` and `InMemoryPageDevice` both implement it), `AtomicPageDevice` (batch writes that survive a crash whole or not at all; `FilePageDevice` implements it) and `ReplacementPolicy` (the buffer pool's eviction contract; `LruReplacementPolicy` implements it).
 - **`pipeline.py`** — everything else: the binary codec (`encode_leaf_page` / `decode_leaf_page` / ... ), the two `PageDevice` implementations, `BufferPool`, and `BPlusTree` (`search`, `insert`, `delete`, `scan`).
 - **`__main__.py`** — a demonstration CLI (`put`, `get`, `delete`, `scan`, `info`, `benchmark`).
 
