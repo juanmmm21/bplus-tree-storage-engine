@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bplus-tree-storage-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "A disk-backed B+Tree storage engine with buffer pool management and page-level indexing, built from scratch."
 readme = "README.md"
 requires-python = ">=3.11"
